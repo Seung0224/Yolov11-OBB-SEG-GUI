@@ -9,9 +9,7 @@ TensorRT `.engine` 및 PyTorch `.pt` 모델을 모두 실행할 수 있으며,
 Tkinter UI를 통해 이미지 로드 → 추론 → 시각화 → 결과 저장 과정을 간단히 수행할 수 있습니다.
 
 ---
-
-<img width="1002" height="732" alt="image" src="https://github.com/user-attachments/assets/889f3b3b-1d2d-4bf7-88bb-1264db9fbefb" />
-
+<img width="1202" height="832" alt="image" src="https://github.com/user-attachments/assets/cb7250d6-f935-41bb-9e42-dc3f1993abea" />
 
 ## 📦 프로젝트 개요
 
