@@ -21,7 +21,162 @@ MASK_THR_DEFAULT = 0.5
 ALPHA_DEFAULT = 0.45
 WINDOW_TITLE = "YOLOv11"
 
-#region Overlay SEG
+# =========================
+# 이미지 패널 (Canvas + Scrollbar + Zoom/Pan)
+# =========================
+class ImagePane(tk.Frame):
+    def __init__(self, master, title=""):
+        super().__init__(master)
+
+        # 제목 바
+        titlebar = tk.Frame(self)
+        titlebar.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self.title_label = tk.Label(titlebar, text=title, anchor="w")
+        self.title_label.pack(side=tk.LEFT)
+
+        # 캔버스 + 스크롤
+        body = tk.Frame(self, bd=1, relief=tk.SUNKEN)
+        body.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.canvas = tk.Canvas(body, bg="black", highlightthickness=0)
+        self.hbar = tk.Scrollbar(body, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.vbar = tk.Scrollbar(body, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.hbar.set, yscrollcommand=self.vbar.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar.grid(row=1, column=0, sticky="ew")
+
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        # 상태
+        self.img_bgr = None
+        self._pil = None
+        self._tk = None
+        self.zoom = 1.0
+        self.min_zoom = 0.1
+        self.max_zoom = 5.0
+        self._image_id = None
+        self._drag_origin = None
+
+        # 바인딩
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<Configure>", lambda e: self.render())  # 리사이즈 시 재렌더
+        # Ctrl + 휠 확대/축소 (Windows/Unix 공통 처리)
+        self.canvas.bind("<Control-MouseWheel>", self._on_wheel)       # Windows
+        self.canvas.bind("<Control-Button-4>", self._on_wheel_linux)   # Linux up
+        self.canvas.bind("<Control-Button-5>", self._on_wheel_linux)   # Linux down
+
+        self.on_zoom_changed = None  # 외부 콜백(좌/우 동기화용)
+
+    def set_title(self, text: str):
+        self.title_label.config(text=text)
+
+    def set_image(self, img_bgr: np.ndarray | None, placeholder: str | None = None):
+        """BGR np.ndarray 설정. None이면 placeholder 텍스트 표시."""
+        self.img_bgr = img_bgr
+        if img_bgr is None:
+            self._pil = None
+            self._tk = None
+            self._draw_placeholder(placeholder or "No image")
+        else:
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            self._pil = Image.fromarray(img_rgb)
+            self._tk = None
+            self.render()
+
+    def _draw_placeholder(self, text="No image"):
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width() or 400
+        h = self.canvas.winfo_height() or 300
+        self.canvas.config(scrollregion=(0, 0, w, h))
+        self._image_id = None
+        self.canvas.create_text(
+            w // 2, h // 2,
+            text=text,
+            fill="#CCCCCC",
+            font=("Segoe UI", 14, "bold")
+        )
+
+    def render(self):
+        if self._pil is None:
+            self._draw_placeholder()
+            return
+
+        base_w, base_h = self._pil.size
+        target_w = max(1, int(base_w * self.zoom))
+        target_h = max(1, int(base_h * self.zoom))
+
+        disp = self._pil.resize((target_w, target_h), Image.Resampling.BILINEAR)
+        self._tk = ImageTk.PhotoImage(disp)
+
+        self.canvas.delete("all")
+        self._image_id = self.canvas.create_image(0, 0, image=self._tk, anchor="nw")
+        self.canvas.config(scrollregion=(0, 0, target_w, target_h))
+
+    def zoom_in(self, step=0.1):
+        self.set_zoom(self.zoom * (1.0 + step))
+
+    def zoom_out(self, step=0.1):
+        self.set_zoom(self.zoom / (1.0 + step))
+
+    def reset_zoom(self):
+        self.zoom = 1.0
+        self.render()
+
+    def fit_to_window(self, margin=8):
+        """현재 캔버스 크기에 맞춰 '가득' 보이도록 줌 자동 계산."""
+        if self._pil is None:
+            return
+        cw = max(1, self.canvas.winfo_width() - margin)
+        ch = max(1, self.canvas.winfo_height() - margin)
+        iw, ih = self._pil.size
+        if iw == 0 or ih == 0:
+            return
+        z = min(cw / iw, ch / ih)
+        z = max(self.min_zoom, min(self.max_zoom, z))
+        self.zoom = z
+        self.render()
+
+    def set_zoom(self, value: float):
+        """줌 설정 + 변경 이벤트 콜백(동기화용)"""
+        value = max(self.min_zoom, min(self.max_zoom, float(value)))
+        if abs(value - self.zoom) > 1e-6:
+            self.zoom = value
+            self.render()
+            if callable(self.on_zoom_changed):
+                self.on_zoom_changed(self.zoom, origin=self)
+
+    def _on_press(self, event):
+        # 패닝 시작
+        self._drag_origin = (event.x, event.y)
+        self.canvas.scan_mark(event.x, event.y)
+
+    def _on_drag(self, event):
+        # 드래그로 패닝
+        if self._drag_origin is not None:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _on_wheel(self, event):
+        # Windows: event.delta 양수=up, 음수=down (Control과 함께 바인딩됨)
+        if event.delta > 0:
+            self.zoom_in(0.2)
+        else:
+            self.zoom_out(0.2)
+
+    def _on_wheel_linux(self, event):
+        # Linux: Button-4(up), Button-5(down)
+        if event.num == 4:
+            self.zoom_in(0.2)
+        elif event.num == 5:
+            self.zoom_out(0.2)
+
+
+# =========================
+# Overlay SEG
+# =========================
 def draw_segmentation_on_image(
     img_bgr,
     result,
@@ -32,37 +187,20 @@ def draw_segmentation_on_image(
     font_scale=FONT_SCALE,
     padding=PADDING,
 ):
-    """
-    result.masks 기반으로 폴리곤(외곽선) + 반투명 채우기.
-    - 채우기: binary mask 기반 addWeighted
-    - 라벨: 최대 외곽 컨투어 중심 근처에 캡션
-    - cls/conf: result.boxes의 cls/conf 사용(있으면)
-    """
     base = img_bgr.copy()
     h, w = base.shape[:2]
 
     masks = getattr(result, "masks", None)
     if masks is None or getattr(masks, "data", None) is None:
-        cv2.putText(
-            base,
-            "No segmentation masks",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(base, "No segmentation masks", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
         return base
 
-    # N x H x W
     mask_data = masks.data
     mask_np = mask_data.cpu().numpy() if hasattr(mask_data, "cpu") else np.asarray(mask_data)
 
-    # 클래스/점수는 boxes에서 끌어옴(세그 결과에도 같이 옴)
     boxes = getattr(result, "boxes", None)
-    cls_ids = None
-    confs = None
+    cls_ids = confs = None
     if boxes is not None:
         if getattr(boxes, "cls", None) is not None:
             cls_ids = boxes.cls.int().cpu().numpy() if hasattr(boxes.cls, "cpu") else boxes.cls.astype(int)
@@ -70,7 +208,6 @@ def draw_segmentation_on_image(
             confs = boxes.conf.cpu().numpy() if hasattr(boxes, "cpu") else boxes.conf
 
     N = mask_np.shape[0]
-    # 정렬(위->아래, 좌->우) 위해 중심 추정
     cx = np.zeros(N, dtype=float)
     cy = np.zeros(N, dtype=float)
     for i in range(N):
@@ -93,24 +230,20 @@ def draw_segmentation_on_image(
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
 
     for i in range(mask_np.shape[0]):
-        m = (mask_np[i] > thr).astype(np.uint8)  # 0/1
+        m = (mask_np[i] > thr).astype(np.uint8)
         if m.max() == 0:
             continue
 
-        # 색상은 class(seed) 기반
         cls_i = int(cls_ids[i]) if (isinstance(cls_ids, np.ndarray) and i < len(cls_ids)) else i
         rng = np.random.default_rng(seed=int(cls_i * 123457))
         color = rng.integers(low=64, high=255, size=3, dtype=np.uint8).tolist()
 
-        # 채우기(반투명)
         colored = np.zeros_like(overlay)
         colored[m == 1] = color
         overlay = cv2.add(overlay, colored)
 
-        # 외곽선 폴리곤 그리기 (컨투어 이용)
         contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
-            # 가장 큰 외곽선 기준으로 캡션 위치 계산
             c = max(contours, key=cv2.contourArea)
             cv2.polylines(base, [c], isClosed=True, color=tuple(int(x) for x in color), thickness=line_thickness)
 
@@ -122,7 +255,6 @@ def draw_segmentation_on_image(
                 x, y, ww, hh = cv2.boundingRect(c)
                 tx, ty = x + ww // 2, y + hh // 2
 
-            # 라벨/점수
             label = names.get(cls_i, str(cls_i)) if isinstance(names, dict) else str(cls_i)
             score = float(confs[i]) if (isinstance(confs, np.ndarray) and i < len(confs)) else None
             caption = f"{label} {score:.2f}" if score is not None else f"{label}"
@@ -148,12 +280,12 @@ def draw_segmentation_on_image(
                 cv2.LINE_AA,
             )
 
-    # 반투명 블렌딩
-    base = cv2.addWeighted(base, 1.0, overlay, alpha, 0)
+    base = cv2.addWeighted(base, 1.0, overlay, ALPHA_DEFAULT, 0)
     return base
-#endreigon
 
-#region Overlay OBB
+# =========================
+# Overlay OBB
+# =========================
 def draw_obb_on_image(
     img_bgr,
     result,
@@ -162,100 +294,49 @@ def draw_obb_on_image(
     font_scale=FONT_SCALE,
     padding=PADDING,
 ):
-    """
-    result.obb 에서 xyxyxyxy 또는 xywhr만 사용.
-    axis-aligned DET(boxes)나 SEG(masks)는 일절 사용하지 않음.
-    """
     base = img_bgr.copy()
     h, w = base.shape[:2]
 
     obb = getattr(result, "obb", None)
     if obb is None:
-        cv2.putText(
-            base,
-            "No OBB results",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(base, "No OBB results", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
         return base
 
-    polys = None
-    confs = None
-    clss = None
+    polys = confs = clss = None
 
-    # 좌표/메타 추출
     if getattr(obb, "xyxyxyxy", None) is not None:
         polys = obb.xyxyxyxy
         polys = polys.cpu().numpy() if hasattr(polys, "cpu") else polys
-        confs = (
-            obb.conf.cpu().numpy()
-            if getattr(obb, "conf", None) is not None
-            and hasattr(obb, "conf")
-            and hasattr(obb.conf, "cpu")
-            else getattr(obb, "conf", None)
-        )
-        clss = (
-            obb.cls.cpu().numpy().astype(int)
-            if getattr(obb, "cls", None) is not None
-            and hasattr(obb, "cls")
-            and hasattr(obb, "cpu")
-            else getattr(obb, "cls", None)
-        )
+        confs = obb.conf.cpu().numpy() if getattr(obb, "conf", None) is not None and hasattr(obb, "conf") and hasattr(obb.conf, "cpu") else getattr(obb, "conf", None)
+        clss = obb.cls.cpu().numpy().astype(int) if getattr(obb, "cls", None) is not None and hasattr(obb, "cls") and hasattr(obb, "cpu") else getattr(obb, "cls", None)
 
     elif getattr(obb, "xywhr", None) is not None:
         xywhr = obb.xywhr
         xywhr = xywhr.cpu().numpy() if hasattr(xywhr, "cpu") else xywhr
-        confs = (
-            obb.conf.cpu().numpy()
-            if getattr(obb, "conf", None) is not None
-            and hasattr(obb, "conf")
-            and hasattr(obb.conf, "cpu")
-            else getattr(obb, "conf", None)
-        )
-        clss = (
-            obb.cls.cpu().numpy().astype(int)
-            if getattr(obb, "cls", None) is not None
-            and hasattr(obb, "cls")
-            and hasattr(obb, "cpu")
-            else getattr(obb, "cls", None)
-        )
+        confs = obb.conf.cpu().numpy() if getattr(obb, "conf", None) is not None and hasattr(obb, "conf") and hasattr(obb.conf, "cpu") else getattr(obb, "conf", None)
+        clss = obb.cls.cpu().numpy().astype(int) if getattr(obb, "cls", None) is not None and hasattr(obb, "cls") and hasattr(obb, "cpu") else getattr(obb, "cls", None)
 
         polys_list = []
         for row in xywhr:
             xc, yc, ww, hh, theta = row[:5]
             deg = float(theta)
-            # rad일 수 있으니 rad -> deg 보정
             if abs(deg) <= math.pi * 2:
                 deg = deg * 180.0 / math.pi
             rect = ((float(xc), float(yc)), (float(ww), float(hh)), float(deg))
-            pts = cv2.boxPoints(rect)  # 4x2
+            pts = cv2.boxPoints(rect)
             polys_list.append(pts.reshape(-1))
         polys = np.array(polys_list, dtype=np.float32)
 
-    # 결과 없음
     if polys is None or len(polys) == 0:
-        cv2.putText(
-            base,
-            "No OBB results",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(base, "No OBB results", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
         return base
 
-    # 드로잉
     for i in range(len(polys)):
         poly = polys[i]
         pts = poly.reshape(-1, 1, 2).astype(int)
 
-        # 화면 밖 값 클램프(이상치 방지)
         pts[:, 0, 0] = np.clip(pts[:, 0, 0], 0, w - 1)
         pts[:, 0, 1] = np.clip(pts[:, 0, 1], 0, h - 1)
 
@@ -272,30 +353,17 @@ def draw_obb_on_image(
         caption = f"{label} {conf:.2f}" if conf is not None else f"{label}"
 
         x1, y1 = int(pts[0][0][0]), int(pts[0][0][1])
-        (tw, th), baseline = cv2.getTextSize(
-            caption, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, LINE_THICKNESS
-        )
-        cv2.rectangle(
-            base,
-            (x1, y1 - th - baseline - padding),
-            (x1 + tw + padding * 2, y1),
-            color,
-            -1,
-        )
-        cv2.putText(
-            base,
-            caption,
-            (x1 + padding, y1 - baseline - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            FONT_SCALE,
-            (255, 255, 255),
-            LINE_THICKNESS,
-            cv2.LINE_AA,
-        )
+        (tw, th), baseline = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, LINE_THICKNESS)
+        cv2.rectangle(base, (x1, y1 - th - baseline - padding), (x1 + tw + padding * 2, y1), color, -1)
+        cv2.putText(base, caption, (x1 + padding, y1 - baseline - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, (255, 255, 255),
+                    LINE_THICKNESS, cv2.LINE_AA)
 
     return base
-#endregion
 
+# =========================
+# 메인 앱
+# =========================
 class YoloApp:
     def __init__(self, master):
         self.mode = None
@@ -308,7 +376,7 @@ class YoloApp:
 
         # engine flags
         self.is_engine = str(self.model_path).lower().endswith(".engine")
-        self.engine_imgsz = None  # 엔진 입력 크기 (로드 후 보정)
+        self.engine_imgsz = None
 
         # state
         self.image_path = None
@@ -316,13 +384,11 @@ class YoloApp:
         self.vis_bgr = None
         self.names = {}
 
-        # ========== UI ==========
+        # ========== 상단 UI ==========
         top = tk.Frame(master)
         top.pack(fill=tk.X, padx=8, pady=(8, 4))
 
-        self.model_label = tk.Label(
-            top, text=f"Model: {self.model_path}  (Device: {self.device})", anchor="w"
-        )
+        self.model_label = tk.Label(top, text=f"Model: {self.model_path}  (Device: {self.device})", anchor="w")
         self.model_label.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
 
         self.btn_select_model = tk.Button(top, text="Change Model...", command=self.change_model)
@@ -334,21 +400,18 @@ class YoloApp:
         self.btn_load = tk.Button(actions, text="Load Image", width=14, command=self.load_image)
         self.btn_load.pack(side=tk.LEFT, padx=4)
 
-        self.btn_infer = tk.Button(
-            actions, text="Run Inference", width=18, command=self.run_inference, state=tk.DISABLED
-        )
+        self.btn_infer = tk.Button(actions, text="Run Inference", width=18, command=self.run_inference, state=tk.DISABLED)
         self.btn_infer.pack(side=tk.LEFT, padx=4)
 
-        self.btn_save = tk.Button(
-            actions, text="Save Result", width=14, command=self.save_result, state=tk.DISABLED
-        )
+        self.btn_save = tk.Button(actions, text="Save Result", width=14, command=self.save_result, state=tk.DISABLED)
         self.btn_save.pack(side=tk.LEFT, padx=4)
 
         self.btn_clear = tk.Button(actions, text="Clear", width=10, command=self.clear_view, state=tk.NORMAL)
         self.btn_clear.pack(side=tk.LEFT, padx=4)
 
+        # 파라미터
         params = tk.Frame(master)
-        params.pack(fill=tk.X, padx=8, pady=(0, 8))
+        params.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         self.conf_label = tk.Label(params, text="Conf:")
         self.conf_label.pack(side=tk.LEFT, padx=(4, 2))
@@ -368,11 +431,103 @@ class YoloApp:
         self.maskthr_entry = tk.Entry(params, textvariable=self.maskthr_var, width=6)
         self.maskthr_entry.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.canvas = tk.Label(master, bd=1, relief=tk.SUNKEN)
-        self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        # ========================
+        # 줌 컨트롤
+        zoombar = tk.Frame(master)
+        zoombar.pack(fill=tk.X, padx=8, pady=(0, 8))
+        tk.Label(zoombar, text="Zoom:").pack(side=tk.LEFT, padx=(4, 6))
+        self.btn_zoom_in = tk.Button(zoombar, text="Zoom In (+)", command=lambda: self._zoom_both("in"))
+        self.btn_zoom_in.pack(side=tk.LEFT, padx=2)
+        self.btn_zoom_out = tk.Button(zoombar, text="Zoom Out (-)", command=lambda: self._zoom_both("out"))
+        self.btn_zoom_out.pack(side=tk.LEFT, padx=2)
+        self.btn_fit = tk.Button(zoombar, text="Fit", command=self._fit_both)
+        self.btn_fit.pack(side=tk.LEFT, padx=2)
+        self.btn_reset = tk.Button(zoombar, text="Reset (1:1)", command=self._reset_both)
+        self.btn_reset.pack(side=tk.LEFT, padx=2)
+
+        # ========== 중앙 분할 뷰 ==========
+        self.split = tk.PanedWindow(master, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
+        self.split.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        self.left_pane = ImagePane(self.split, title="Original")
+        self.right_pane = ImagePane(self.split, title="Result")
+
+        self.split.add(self.left_pane, minsize=300)
+        self.split.add(self.right_pane, minsize=300)
+
+        # 좌/우 줌 동기화 훅 설치
+        self._install_sync_hooks()
+
+        # 단축키(윈도우 기준)
+        master.bind("+", lambda e: self._zoom_both("in"))
+        master.bind("-", lambda e: self._zoom_both("out"))
+        master.bind("<Return>", lambda e: self._fit_both())
 
         self._update_buttons()
+
+    # ===== 동기화/배치 헬퍼 =====
+    def _install_sync_hooks(self):
+        def handler(z, origin):
+            other = self.right_pane if origin is self.left_pane else self.left_pane
+            if abs(other.zoom - z) > 1e-6:
+                # 재귀 방지: 잠시 콜백 해제
+                cb = other.on_zoom_changed
+                other.on_zoom_changed = None
+                other.set_zoom(z)
+                other.on_zoom_changed = cb
+        self.left_pane.on_zoom_changed = handler
+        self.right_pane.on_zoom_changed = handler
+
+    def _center_split(self):
+        self.split.update_idletasks()
+        w = max(1, self.split.winfo_width())
+        try:
+            self.split.sash_place(0, w // 2, 1)  # 중앙 배치
+        except Exception:
+            pass
+
+    # ===== Zoom helpers =====
+    def _zoom_both(self, direction):
+        if direction == "in":
+            self.left_pane.zoom_in(0.2)
+            self.right_pane.zoom_in(0.2)
+        elif direction == "out":
+            self.left_pane.zoom_out(0.2)
+            self.right_pane.zoom_out(0.2)
+
+    def _fit_both(self):
+        """결과 패널이 있으면 그 기준으로 배율 계산, 없으면 원본 기준."""
+        self.master.update_idletasks()
+
+        def fit_zoom(pane: ImagePane, margin=8):
+            if pane._pil is None:
+                return None
+            cw = max(1, pane.canvas.winfo_width() - margin)
+            ch = max(1, pane.canvas.winfo_height() - margin)
+            iw, ih = pane._pil.size
+            z = min(cw / iw, ch / ih)
+            return max(pane.min_zoom, min(pane.max_zoom, z))
+
+        z = fit_zoom(self.right_pane) if self.right_pane._pil is not None else fit_zoom(self.left_pane)
+        if z is not None:
+            # 재귀 방지 위해 한쪽씩 설정
+            cb_l, cb_r = self.left_pane.on_zoom_changed, self.right_pane.on_zoom_changed
+            self.left_pane.on_zoom_changed = None
+            self.right_pane.on_zoom_changed = None
+            self.left_pane.set_zoom(z)
+            self.right_pane.set_zoom(z)
+            self.left_pane.on_zoom_changed, self.right_pane.on_zoom_changed = cb_l, cb_r
+
+        self._center_split()
+
+    def _reset_both(self):
+        """1:1(무배율)로 통일 + 스플릿 중앙."""
+        cb_l, cb_r = self.left_pane.on_zoom_changed, self.right_pane.on_zoom_changed
+        self.left_pane.on_zoom_changed = None
+        self.right_pane.on_zoom_changed = None
+        self.left_pane.reset_zoom()
+        self.right_pane.reset_zoom()
+        self.left_pane.on_zoom_changed, self.right_pane.on_zoom_changed = cb_l, cb_r
+        self._center_split()
 
     # --- Model load / change ---
     def change_model(self):
@@ -431,7 +586,6 @@ class YoloApp:
             self.device = "cpu"
 
     def _detect_engine_imgsz_from_model(self):
-        """엔진 입력 크기를 overrides/args/파일명에서 최대한 추출"""
         if not self.is_engine or self.model is None:
             return None
         eng_sz = None
@@ -454,7 +608,6 @@ class YoloApp:
         if isinstance(eng_sz, int):
             return eng_sz
 
-        # 파일명 힌트 *_320.engine
         try:
             m = re.search(r'_(\d{3,4})\.engine$', os.path.basename(self.model_path), flags=re.IGNORECASE)
             if m:
@@ -462,54 +615,48 @@ class YoloApp:
         except Exception:
             pass
         return None
-    
+
     @staticmethod
     def guess_task_from_filename(path: str):
-        """파일명에서 task 힌트 추출: SEG -> 'segment', OBD/OBB -> 'obb'"""
         base = os.path.basename(str(path)).lower()
-        if re.search(r'(^|[._-])obd($|[._-])', base) or \
-            'obb' in base or 'oriented' in base or 'rbox' in base:
+        if re.search(r'(^|[._-])obd($|[._-])', base) or 'obb' in base or 'oriented' in base or 'rbox' in base:
             return 'obb'
-        if re.search(r'(^|[._-])seg($|[._-])', base) or \
-            'segment' in base or 'segm' in base or 'mask' in base:
+        if re.search(r'(^|[._-])seg($|[._-])', base) or 'segment' in base or 'segm' in base or 'mask' in base:
             return 'segment'
         return None
-        
+
     def load_model(self):
         if self.model is not None:
             return
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
-        
+
         self._ensure_cuda_for_engine()
 
-        # 파일명 힌트로 태스크 결정
-        task_hint = self.guess_task_from_filename(self.model_path)  # 'segment' | 'obb' | None
+        task_hint = self.guess_task_from_filename(self.model_path)
         force_task = task_hint
 
-        # 모델 로드 (ultralytics 버전별 task 인자 미지원 대비)
         try:
-                self.model = YOLO(self.model_path, task=force_task) if force_task else YOLO(self.model_path)
+            self.model = YOLO(self.model_path, task=force_task) if force_task else YOLO(self.model_path)
         except TypeError:
-                self.model = YOLO(self.model_path)
+            self.model = YOLO(self.model_path)
 
-        # 엔진 메타 부재/오추정 대비: 내부 메타에도 태스크 주입
         if force_task in ("segment", "obb"):
             try:
                 setattr(self.model, "task", force_task)
             except Exception:
                 pass
-                for attr in ("overrides", "args"):
-                    try:
-                        d = getattr(self.model, attr, None)
-                        if isinstance(d, dict):
-                            d["task"] = force_task
-                    except Exception:
-                        pass
+            for attr in ("overrides", "args"):
+                try:
+                    d = getattr(self.model, attr, None)
+                    if isinstance(d, dict):
+                        d["task"] = force_task
+                except Exception:
+                    pass
 
         self.names = getattr(self.model, "names", None)
         if not self.names:
-                self.names = getattr(getattr(self.model, "model", None), "names", {}) or {}
+            self.names = getattr(getattr(self.model, "model", None), "names", {}) or {}
         if not isinstance(self.names, dict):
             try:
                 self.names = dict(self.names)
@@ -523,41 +670,34 @@ class YoloApp:
 
         self.mode = force_task or getattr(self.model, "task", None) or "detect"
 
-        self.model_label.config(
-                text=f"Model: {self.model_path}  (Device: {self.device})  [Mode: {self.mode}]"
-        )
+        self.model_label.config(text=f"Model: {self.model_path}  (Device: {self.device})  [Mode: {self.mode}]")
 
     def _ensure_engine_imgsz_for_predict(self, src_for_predict, imgsz):
         if not self.is_engine:
             return imgsz
-        
 
         kwargs = dict(
-        source=src_for_predict,
-        imgsz=imgsz,
-        conf=0.01,
-        iou=0.99,
-        max_det=1,
-        verbose=False,
-        device=0,
-        half=torch.cuda.is_available(),
-        task=self.mode,
+            source=src_for_predict,
+            imgsz=imgsz,
+            conf=0.01,
+            iou=0.99,
+            max_det=1,
+            verbose=False,
+            device=0,
+            half=torch.cuda.is_available(),
+            task=self.mode,
         )
-
-        if self.mode == "segment": 
+        if self.mode == "segment":
             kwargs["retina_masks"] = True
 
         self.model.predict(**kwargs)
-        return imgsz  # 성공
+        return imgsz
 
     # --- UI / IO ---
     def load_image(self):
         path = filedialog.askopenfilename(
             title="Select image",
-            filetypes=[
-                ("Image files", "*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff"),
-                ("All files", "*.*"),
-            ],
+            filetypes=[("Image files", "*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff"), ("All files", "*.*")]
         )
         if not path:
             return
@@ -567,27 +707,16 @@ class YoloApp:
             messagebox.showerror("Error", "Failed to load image.")
             return
         self.vis_bgr = None
-        self._update_view(self.src_bgr)
+
+        # 좌: 원본, 우: 플레이스홀더
+        self.left_pane.set_title(f"Original  ({os.path.basename(path)})")
+        self.left_pane.set_image(self.src_bgr)
+        self.right_pane.set_title("Result")
+        self.right_pane.set_image(None, placeholder="Run inference to see result")
+
+        # 1:1로 통일 + 중앙 분할
+        self._reset_both()
         self._update_buttons()
-
-    def _update_view(self, img_bgr):
-        display = self._fit_to_window(img_bgr, max_w=1280, max_h=720)
-        img_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-        im = Image.fromarray(img_rgb)
-        imgtk = ImageTk.PhotoImage(image=im)
-        self.canvas.imgtk = imgtk
-        self.canvas.configure(image=imgtk)
-
-    @staticmethod
-    def _fit_to_window(img_bgr, max_w=1280, max_h=720):
-        h, w = img_bgr.shape[:2]
-        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
-        if scale < 1.0:
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            return cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        return img_bgr
-
 
     def run_inference(self):
         if self.src_bgr is None:
@@ -600,23 +729,18 @@ class YoloApp:
                 self.btn_save.config(state=tk.DISABLED)
                 self.master.config(cursor="watch")
 
-                # 모델 로드 → self.mode 확정('segment' or 'obb')
                 self.load_model()
 
                 conf = float(self.conf_var.get())
                 iou = float(self.iou_var.get())
-                # (1) segment일 때만 mthr 사용
                 mthr = float(self.maskthr_var.get()) if self.mode == "segment" else None
                 imgsz = self.engine_imgsz or (640 if torch.cuda.is_available() else 512)
 
-                # 항상 numpy 입력으로 통일
                 src_for_predict = self.src_bgr
 
-                # 엔진이면 imgsz 자동 교정(호환 체크 겸 1회 예측)
                 if self.is_engine:
                     imgsz = self._ensure_engine_imgsz_for_predict(src_for_predict, imgsz)
 
-                # optional warmup
                 try:
                     if hasattr(self.model, "warmup"):
                         self.model.warmup(
@@ -631,7 +755,6 @@ class YoloApp:
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
 
-                # 공통 예측 인자
                 predict_args = dict(
                     source=src_for_predict,
                     imgsz=imgsz,
@@ -640,13 +763,11 @@ class YoloApp:
                     max_det=(100 if self.mode == "segment" else 50),
                     agnostic_nms=False,
                     verbose=False,
-                    task=self.mode,  # (2) task는 self.mode로
+                    task=self.mode,
                 )
-                # (3) segment일 때만 retina_masks 전달
                 if self.mode == "segment":
                     predict_args["retina_masks"] = True
 
-                # device/half
                 if self.is_engine:
                     if not torch.cuda.is_available():
                         raise RuntimeError("TensorRT engine requires CUDA (GPU).")
@@ -668,7 +789,6 @@ class YoloApp:
 
                 res = results[0]
 
-                # 엔진 유효성 체크
                 if self.is_engine and self.mode == "segment":
                     if (getattr(res, "masks", None) is None) or (getattr(getattr(res, "masks", None), "data", None) is None):
                         messagebox.showerror(
@@ -690,7 +810,6 @@ class YoloApp:
                         )
                         return
 
-                # names 보정
                 safe_names = {}
                 if isinstance(self.names, dict):
                     safe_names.update(self.names)
@@ -705,12 +824,11 @@ class YoloApp:
                 except Exception:
                     pass
 
-                # 항상 res.orig_img 기준으로 드로잉
+                # >>> NumPy truth value 에러 방지: 명시적 None 체크 <<<
                 base = getattr(res, "orig_img", None)
                 if base is None:
                     base = self.src_bgr
 
-                # (4) 모드별 Overlay
                 if self.mode == "segment":
                     vis = draw_segmentation_on_image(
                         base, res, safe_names,
@@ -731,7 +849,16 @@ class YoloApp:
                     raise ValueError(f"Unsupported mode: {self.mode}")
 
                 self.vis_bgr = vis
-                self._update_view(self.vis_bgr)
+
+                # 좌/우 업데이트
+                self.left_pane.set_title(f"Original  ({os.path.basename(self.image_path)})")
+                self.left_pane.set_image(self.src_bgr)
+                self.right_pane.set_title(f"Result  [{self.mode.upper()}]")
+                self.right_pane.set_image(self.vis_bgr)
+
+                # 1:1 동일 배율 + 중앙 분할
+                self._reset_both()
+
                 self.btn_save.config(state=tk.NORMAL)
 
                 total_ms = (t1 - t0) * 1000.0
@@ -750,37 +877,29 @@ class YoloApp:
 
         threading.Thread(target=_infer_thread, daemon=True).start()
 
-
     def clear_view(self):
         self.image_path = None
         self.src_bgr = None
         self.vis_bgr = None
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(
-            blank,
-            "Load an image to begin",
-            (30, 240),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (200, 200, 200),
-            2,
-            cv2.LINE_AA,
-        )
-        self._update_view(blank)
+
+        self.left_pane.set_title("Original")
+        self.left_pane.set_image(None, placeholder="Load an image to begin")
+        self.right_pane.set_title("Result")
+        self.right_pane.set_image(None, placeholder="Run inference to see result")
+
         self._update_buttons()
 
     def _update_buttons(self):
         self.btn_infer.config(state=(tk.NORMAL if self.src_bgr is not None else tk.DISABLED))
         self.btn_save.config(state=(tk.NORMAL if self.vis_bgr is not None else tk.DISABLED))
 
-
 def main():
     root = tk.Tk()
     app = YoloApp(root)
     app.clear_view()
-    root.geometry("1000x700")
+    root.geometry("1200x800")
+    root.minsize(900, 600)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
