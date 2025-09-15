@@ -11,7 +11,7 @@ from PIL import Image, ImageTk
 import torch
 from ultralytics import YOLO
 
-DEFAULT_MODEL_PATH = r"D:\DLP\OS\Model\SEG\SEG.engine"  # or .pt
+DEFAULT_MODEL_PATH = r"D:\DLP\OS\Model\SEG\SEG.onnx"  # or .pt
 CONF_DEFAULT = 0.25
 IOU_DEFAULT = 0.45
 LINE_THICKNESS = 2
@@ -546,7 +546,7 @@ class YoloApp:
     def change_model(self):
         path = filedialog.askopenfilename(
             title="Select YOLO model (.pt or .engine)",
-            filetypes=[("Ultralytics/TensorRT", "*.pt;*.engine"), ("All files", "*.*")]
+            filetypes=[("Ultralytics/Onnx/TensorRT", "*.pt;*.onnx;*.engine"), ("All files", "*.*")]
         )
         if not path:
             return
@@ -731,6 +731,9 @@ class YoloApp:
         self._reset_both()
         self._update_buttons()
 
+
+
+
     def run_inference(self):
         if self.src_bgr is None:
             messagebox.showwarning("Warning", "Please load an image first.")
@@ -744,6 +747,10 @@ class YoloApp:
 
                 self.load_model()
 
+                # ── ONNX 감지 ─────────────────────────────────────────────
+                is_onnx = str(self.model_path).lower().endswith(".onnx")
+                # ─────────────────────────────────────────────────────────
+
                 conf = float(self.conf_var.get())
                 iou = float(self.iou_var.get())
                 mthr = float(self.maskthr_var.get()) if self.mode == "segment" else None
@@ -754,17 +761,17 @@ class YoloApp:
                 if self.is_engine:
                     imgsz = self._ensure_engine_imgsz_for_predict(src_for_predict, imgsz)
 
+                # ── warmup: ONNX는 생략 (ORT 백엔드라 의미 없고, 장치 혼선 방지) ──
                 try:
-                    if hasattr(self.model, "warmup"):
-                        self.model.warmup(
-                            imgsz=(1, 3, imgsz, imgsz),
-                            device=(0 if (self.is_engine and torch.cuda.is_available())
-                                    else (0 if self.device == "cuda" else "cpu"))
-                        )
+                    if (not is_onnx) and hasattr(self.model, "warmup"):
+                        warmup_device = (0 if (self.is_engine and torch.cuda.is_available())
+                                        else (0 if self.device == "cuda" else "cpu"))
+                        self.model.warmup(imgsz=(1, 3, imgsz, imgsz), device=warmup_device)
                 except Exception:
                     pass
 
-                if torch.cuda.is_available():
+                # CUDA 동기화는 실제 CUDA 사용시에만
+                if (not is_onnx) and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
 
@@ -787,12 +794,18 @@ class YoloApp:
                     predict_args["device"] = 0
                     predict_args["half"] = torch.cuda.is_available()
                 else:
-                    predict_args["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-                    predict_args["half"] = torch.cuda.is_available()
+                    if is_onnx:
+                        # ⚠️ PyTorch CUDA(전처리) 사용을 막기 위해 CPU로 설정
+                        #     ONNXRuntime는 내부적으로 CUDAExecutionProvider를 사용해 GPU에서 추론합니다.
+                        predict_args["device"] = "cpu"
+                        predict_args["half"] = False  # ORT에는 half 의미 없음
+                    else:
+                        predict_args["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+                        predict_args["half"] = torch.cuda.is_available()
 
                 results = self.model.predict(**predict_args)
 
-                if torch.cuda.is_available():
+                if (not is_onnx) and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()
 
@@ -837,7 +850,6 @@ class YoloApp:
                 except Exception:
                     pass
 
-                # >>> NumPy truth value 에러 방지: 명시적 None 체크 <<<
                 base = getattr(res, "orig_img", None)
                 if base is None:
                     base = self.src_bgr
@@ -875,8 +887,12 @@ class YoloApp:
                 self.btn_save.config(state=tk.NORMAL)
 
                 total_ms = (t1 - t0) * 1000.0
+                device_str = (
+                    predict_args.get("device", "cpu") if is_onnx
+                    else ("cuda" if torch.cuda.is_available() else "cpu")
+                )
                 print(
-                    f"[INFO] {self.mode.upper()} imgsz={imgsz} device={'cuda' if torch.cuda.is_available() else 'cpu'} "
+                    f"[INFO] {self.mode.upper()} imgsz={imgsz} device={device_str} "
                     f"engine={self.is_engine} time={total_ms:.1f}ms"
                 )
 
@@ -889,6 +905,16 @@ class YoloApp:
                 self._update_buttons()
 
         threading.Thread(target=_infer_thread, daemon=True).start()
+
+
+
+
+
+
+
+
+
+
 
     def clear_view(self):
         self.image_path = None
