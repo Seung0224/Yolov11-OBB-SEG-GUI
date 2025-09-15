@@ -11,7 +11,7 @@ from PIL import Image, ImageTk
 import torch
 from ultralytics import YOLO
 
-DEFAULT_MODEL_PATH = r"D:\TOYPROJECT\OS\Model\SEG\SEG.engine"  # or .pt
+DEFAULT_MODEL_PATH = r"D:\DLP\OS\Model\SEG\SEG.engine"  # or .pt
 CONF_DEFAULT = 0.25
 IOU_DEFAULT = 0.45
 LINE_THICKNESS = 2
@@ -20,6 +20,19 @@ PADDING = 6
 MASK_THR_DEFAULT = 0.5
 ALPHA_DEFAULT = 0.45
 WINDOW_TITLE = "YOLOv11"
+
+
+# CPU Version
+# pip install --upgrade ultralytics pillow opencv-python numpy torch
+
+# GPU Version
+# pip uninstall -y torch torchvision torchaudio
+# pip cache purge
+
+# Onnx Model Export
+# yolo export model="D:\DLP\OS\Model\SEG\SEG.pt" task=segment format=onnx device=cpu imgsz=640 dynamic=False
+
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # =========================
 # 이미지 패널 (Canvas + Scrollbar + Zoom/Pan)
