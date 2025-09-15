@@ -10,6 +10,7 @@ import cv2
 from PIL import Image, ImageTk
 import torch
 from ultralytics import YOLO
+import sys, subprocess, importlib
 
 DEFAULT_MODEL_PATH = r"D:\DLP\OS\Model\SEG\SEG.onnx"  # or .pt
 CONF_DEFAULT = 0.25
@@ -374,6 +375,36 @@ def draw_obb_on_image(
 
     return base
 
+def ensure_ort_cuda():
+    """
+    ONNX Runtime이 CUDAExecutionProvider를 쓸 수 있도록 확인.
+    없으면 onnxruntime-gpu를 설치 시도하고, 성공하면 True, 아니면 False 반환.
+    """
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            print("Using ONNX Runtime CUDAExecutionProvider")
+            return True
+        else:
+            print("ONNXRuntime installed, but CUDAExecutionProvider missing. Trying to install onnxruntime-gpu...")
+    except Exception:
+        print("ONNXRuntime not found. Installing onnxruntime-gpu...")
+
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxruntime-gpu"])
+        importlib.invalidate_caches()
+        import onnxruntime as ort2
+        if "CUDAExecutionProvider" in ort2.get_available_providers():
+            print("Using ONNX Runtime CUDAExecutionProvider")
+            return True
+        else:
+            print("CUDAExecutionProvider still unavailable; will use CPUExecutionProvider.")
+            return False
+    except Exception as e:
+        print("Failed to install onnxruntime-gpu:", e)
+        return False
+
+
 # =========================
 # 메인 앱
 # =========================
@@ -654,18 +685,19 @@ class YoloApp:
         except TypeError:
             self.model = YOLO(self.model_path)
 
-        if force_task in ("segment", "obb"):
+        # 🔧 여기부터 추가: ONNX/ENGINE 로드 시 PyTorch가 GPU를 건드리지 않도록 강제 CPU
+        ext = os.path.splitext(self.model_path)[1].lower()
+        if ext in (".onnx", ".engine"):
             try:
-                setattr(self.model, "task", force_task)
+                # Predictor가 아직 만들어지기 전이면 overrides로, 만들어졌다면 args로 막아줌
+                if isinstance(getattr(self.model, "overrides", None), dict):
+                    self.model.overrides["device"] = "cpu"
+                pred = getattr(self.model, "predictor", None)
+                if pred is not None and hasattr(pred, "args"):
+                    pred.args.device = "cpu"
             except Exception:
                 pass
-            for attr in ("overrides", "args"):
-                try:
-                    d = getattr(self.model, attr, None)
-                    if isinstance(d, dict):
-                        d["task"] = force_task
-                except Exception:
-                    pass
+        # 🔧 추가 끝
 
         self.names = getattr(self.model, "names", None)
         if not self.names:
@@ -731,10 +763,16 @@ class YoloApp:
         self._reset_both()
         self._update_buttons()
 
-
-
-
     def run_inference(self):
+        # 이미지가 화면에 보이지만 내부 버퍼(self.src_bgr)가 None일 수 있으므로, 경로로부터 복구.
+        if self.src_bgr is None and self.image_path:
+            try:
+                restored = cv2.imread(self.image_path, cv2.IMREAD_COLOR)
+                if restored is not None:
+                    self.src_bgr = restored
+            except Exception:
+                pass
+
         if self.src_bgr is None:
             messagebox.showwarning("Warning", "Please load an image first.")
             return
@@ -789,19 +827,25 @@ class YoloApp:
                     predict_args["retina_masks"] = True
 
                 if self.is_engine:
+                    # 엔진 경로는 Ultralytics 내부에서 torch 텐서를 GPU로 올리려 하므로
+                    # 현재 5090(sm_120) + 미지원 PyTorch 조합에선 실패 가능성이 큼.
+                    # 기존 동작은 유지하되, CUDA 없으면 에러를 내도록 그대로 둠.
                     if not torch.cuda.is_available():
                         raise RuntimeError("TensorRT engine requires CUDA (GPU).")
                     predict_args["device"] = 0
-                    predict_args["half"] = torch.cuda.is_available()
+                    predict_args["half"] = False  # TRT가 정밀도를 관리하므로 torch half는 끔(안전)
                 else:
                     if is_onnx:
-                        # ⚠️ PyTorch CUDA(전처리) 사용을 막기 위해 CPU로 설정
-                        #     ONNXRuntime는 내부적으로 CUDAExecutionProvider를 사용해 GPU에서 추론합니다.
+                        # 1) ORT를 GPU로: CUDAExecutionProvider 확보 시도 (필요시 onnxruntime-gpu 자동설치)
+                        used_cuda_ep = ensure_ort_cuda()
+                        print("ONNX Runtime provider:", "CUDAExecutionProvider" if used_cuda_ep else "CPUExecutionProvider")
+                        # 2) PyTorch는 CPU 고정(전처리/후처리만 CPU에서), ORT가 GPU에서 실행됨
                         predict_args["device"] = "cpu"
                         predict_args["half"] = False  # ORT에는 half 의미 없음
                     else:
-                        predict_args["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-                        predict_args["half"] = torch.cuda.is_available()
+                        # .pt 모델은 항상 CPU 강제 — 5090에서 torch CUDA 커널 에러 방지
+                        predict_args["device"] = "cpu"
+                        predict_args["half"] = False
 
                 results = self.model.predict(**predict_args)
 
@@ -887,10 +931,14 @@ class YoloApp:
                 self.btn_save.config(state=tk.NORMAL)
 
                 total_ms = (t1 - t0) * 1000.0
-                device_str = (
-                    predict_args.get("device", "cpu") if is_onnx
-                    else ("cuda" if torch.cuda.is_available() else "cpu")
-                )
+                try:
+                    device_str = (
+                        ("ort-cuda" if used_cuda_ep else "ort-cpu") if is_onnx
+                        else str(predict_args.get("device", "cpu"))
+                    )
+                except NameError:
+                    # used_cuda_ep가 없는 경우(onnx 아닐 때)는 predict_args 기준
+                    device_str = str(predict_args.get("device", "cpu"))
                 print(
                     f"[INFO] {self.mode.upper()} imgsz={imgsz} device={device_str} "
                     f"engine={self.is_engine} time={total_ms:.1f}ms"
