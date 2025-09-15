@@ -5,7 +5,7 @@ Windows 환경에서 **Ultralytics YOLOv11 프레임워크**를 활용하여
 - **Segmentation (Polygon Masks)**  
 
 두 가지 모드를 모두 지원하는 Python 기반 GUI 툴입니다.  
-TensorRT `.engine` 및 PyTorch `.pt` 모델을 모두 실행할 수 있으며,  
+TensorRT `.engine`, PyTorch `.pt`, ONNX `.onnx` 모델을 모두 실행할 수 있으며,  
 Tkinter UI를 통해 이미지 로드 → 추론 → 시각화 → 결과 저장 과정을 간단히 수행할 수 있습니다.
 
 ---
@@ -16,7 +16,7 @@ Tkinter UI를 통해 이미지 로드 → 추론 → 시각화 → 결과 저장
 - **플랫폼:** Visual Studio Code (Python 3.11)  
 - **프레임워크:** Ultralytics YOLOv11  
 - **목적:** 단일 이미지에서 OBB 및 Segmentation 결과를 직관적으로 확인  
-- **모델 포맷:** `.pt` (PyTorch), `.engine` (TensorRT)  
+- **모델 포맷:** `.pt` (PyTorch), `.engine` (TensorRT), `.onnx` (ONNX)  
 - **UI:** Tkinter 기반 GUI  
 
 ---
@@ -24,10 +24,10 @@ Tkinter UI를 통해 이미지 로드 → 추론 → 시각화 → 결과 저장
 ## ✅ 주요 기능
 
 ### 1. 📂 모델 로드
-- PyTorch `.pt` 모델 또는 TensorRT `.engine` 모델 선택 가능  
+- PyTorch `.pt`, TensorRT `.engine`, ONNX `.onnx` 선택 가능  
 - 파일명 자동 분석 → **OBB / SEG 모드** 자동 결정  
-  - `*_seg.engine`, `seg.pt` → Segmentation  
-  - `*_obb.engine`, `obb.pt` → OBB  
+  - `*_seg.engine`, `seg.pt`, `seg.onnx` → Segmentation  
+  - `*_obb.engine`, `obb.pt`, `obb.onnx` → OBB  
 
 ### 2. 🖼️ 이미지 추론
 - SEG 모드: **Polygon 마스크 Overlay** + 클래스명 + 점수  
@@ -52,7 +52,7 @@ Tkinter UI를 통해 이미지 로드 → 추론 → 시각화 → 결과 저장
 
 ## 🧰 사용 방법
 
-1. YOLOv11 모델을 학습 후 `.pt` 또는 `.engine` 포맷으로 준비  
+1. YOLOv11 모델을 학습 후 `.pt`, `.engine`, `.onnx`  포맷으로 준비  
    - Segmentation:  
      ```python
      YOLO("your_seg.pt", task="segment").export(format="engine", imgsz=320, half=True, device=0)
